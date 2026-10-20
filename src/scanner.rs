@@ -322,83 +322,148 @@ where
     F: FnMut(String, String),
     L: FnMut(String),
 {
-    log("Connecting to device session for syslog monitoring...".to_string());
+    log("Connecting to device session for log monitoring...".to_string());
     let session = ActiveDeviceSession::open(udid)
-        .context("Failed to connect to device for syslog scanning")?;
+        .context("Failed to connect to device for log scanning")?;
     let libs = &session.libs;
-    log("Starting com.apple.syslog_relay service on device...".to_string());
-    let service_conn = session.start_service("com.apple.syslog_relay")
-        .context("Failed to start com.apple.syslog_relay service")?;
 
-    let raw_socket = unsafe { (libs.amd_service_connection_get_socket)(service_conn) };
-    if raw_socket <= 0 {
-        unsafe { (libs.amd_service_connection_invalidate)(service_conn) };
-        anyhow::bail!("Invalid syslog socket");
-    }
+    log(format!(
+        "Starting {} service on device...",
+        crate::os_trace::OS_TRACE_SERVICE
+    ));
+    let service_conn = session
+        .start_service(crate::os_trace::OS_TRACE_SERVICE)
+        .with_context(|| {
+            format!(
+                "Failed to start {} service (unified device log)",
+                crate::os_trace::OS_TRACE_SERVICE
+            )
+        })?;
 
-    // Set socket receive timeout
+    // Read frames through the service connection (AMDServiceConnectionReceive)
+    // so secure sessions work too. A socket receive timeout keeps Stop
+    // responsive on plaintext streams; sockets wrapped in TLS are left alone.
     #[cfg(windows)]
     unsafe {
-        let timeout_ms: u32 = 500;
-        setsockopt(
-            raw_socket as usize,
-            SOL_SOCKET,
-            SO_RCVTIMEO,
-            &timeout_ms as *const u32 as *const i8,
-            std::mem::size_of::<u32>() as i32,
+        let io_ctx = (libs.amd_service_connection_get_secure_io_context)(service_conn);
+        if io_ctx.is_null() {
+            let raw_socket = (libs.amd_service_connection_get_socket)(service_conn);
+            if raw_socket > 0 {
+                let timeout_ms: u32 = 500;
+                setsockopt(
+                    raw_socket as usize,
+                    SOL_SOCKET,
+                    SO_RCVTIMEO,
+                    &timeout_ms as *const u32 as *const i8,
+                    std::mem::size_of::<u32>() as i32,
+                );
+            }
+        }
+    }
+
+    // Start the unified activity stream via Apple's own plist sender so the
+    // message framing matches whatever this MobileDevice build expects.
+    log("Requesting unified log activity stream (StartActivity)...".to_string());
+    let request = crate::os_trace::start_activity_request();
+    let mut request_bytes = Vec::new();
+    plist::to_writer_binary(&mut request_bytes, &request)
+        .context("Failed to serialize StartActivity request")?;
+    let cf_request = libs.create_cf_plist_from_bytes(&request_bytes)?;
+    let send_status = unsafe {
+        (libs.amd_service_connection_send_message)(
+            service_conn,
+            cf_request.raw,
+            crate::apple::K_CFPROPERTY_LIST_BINARY_FORMAT_V1_0,
+        )
+    };
+    if send_status != 0 {
+        unsafe {
+            (libs.amd_service_connection_invalidate)(service_conn);
+        }
+        anyhow::bail!(
+            "AMDServiceConnectionSendMessage(StartActivity) failed with code {}",
+            send_status
         );
     }
 
-    log("Syslog relay established. Listening for Wallet & PassKit events...".to_string());
+    let mut reader = crate::os_trace::FrameReader::new(
+        |buf: &mut [u8]| -> i32 {
+            unsafe {
+                (libs.amd_service_connection_receive)(
+                    service_conn,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            }
+        },
+        || stop_flag.load(Ordering::Relaxed),
+    );
+
+    let reply = match reader.read_plist_frame() {
+        Ok(reply) => reply,
+        Err(e) => {
+            unsafe {
+                (libs.amd_service_connection_invalidate)(service_conn);
+            }
+            anyhow::bail!("Device did not acknowledge log streaming: {e}");
+        }
+    };
+    let reply_dict = reply.as_dictionary();
+    let status = reply_dict
+        .and_then(|d| d.get("Status"))
+        .and_then(|v| v.as_string())
+        .unwrap_or_default();
+    if status != "RequestSuccessful" {
+        let detail = reply_dict
+            .and_then(|d| d.get("Error"))
+            .and_then(|v| v.as_string())
+            .unwrap_or("no error details provided");
+        unsafe {
+            (libs.amd_service_connection_invalidate)(service_conn);
+        }
+        anyhow::bail!(
+            "Device refused unified log streaming (Status: {status}, Error: {detail})"
+        );
+    }
+
+    log("Connected to the unified device log stream. Listening for Wallet & PassKit events...".to_string());
     log("Tip: Open Apple Wallet on your iPhone or tap your card to trigger events.".to_string());
 
-    let mut buffer = [0u8; 8192];
-    let mut line_acc = Vec::with_capacity(1024);
-
     while !stop_flag.load(Ordering::Relaxed) {
-        let bytes_read = unsafe {
-            (libs.amd_service_connection_receive)(
-                service_conn,
-                buffer.as_mut_ptr(),
-                buffer.len(),
-            )
-        };
-
-        if bytes_read > 0 {
-            let slice = &buffer[..bytes_read as usize];
-            for &b in slice {
-                if b == b'\n' || b == b'\0' {
-                    if !line_acc.is_empty() {
-                        let line = String::from_utf8_lossy(&line_acc);
-                        let name = extract_card_name_from_line(&line).unwrap_or_default();
-                        for hash in extract_card_hashes_from_line(&line) {
-                            log(format!(
-                                "Found card pass! Name: '{}', Hash: {}",
-                                if name.is_empty() { "Unknown" } else { &name },
-                                hash
-                            ));
-                            add_or_update_card(&hash, &name);
-                            on_card_found(hash, name.clone());
-                        }
-                        line_acc.clear();
-                    }
-                } else if b != b'\r' {
-                    line_acc.push(b);
-                }
+        let (frame_type, payload) = match reader.read_frame() {
+            Ok(frame) => frame,
+            Err(crate::os_trace::FrameError::Interrupted) => break,
+            Err(e) => {
+                log(format!("Unified log stream ended: {e}"));
+                break;
             }
-        } else if bytes_read == 0 {
-            log("Syslog socket closed by device.".to_string());
-            break; // Socket closed
-        } else {
-            // Timeout or transient: sleep briefly to avoid pegging CPU
-            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        if frame_type != crate::os_trace::FRAME_ACTIVITY {
+            continue;
+        }
+        let Some(record) = crate::os_trace::parse_activity_record(&payload) else {
+            continue;
+        };
+        // Multiline messages are preserved: CoreFoundation resource lookup
+        // logs expose Wallet .pkpass paths on a continuation line.
+        for line in crate::os_trace::format_activity_line(&record).split('\n') {
+            let name = extract_card_name_from_line(line).unwrap_or_default();
+            for hash in extract_card_hashes_from_line(line) {
+                log(format!(
+                    "Found card pass! Name: '{}', Hash: {}",
+                    if name.is_empty() { "Unknown" } else { &name },
+                    hash
+                ));
+                add_or_update_card(&hash, &name);
+                on_card_found(hash, name.clone());
+            }
         }
     }
 
     unsafe {
         (libs.amd_service_connection_invalidate)(service_conn);
     }
-    log("Syslog scan stopped.".to_string());
+    log("Log scan stopped.".to_string());
 
     Ok(())
 }
@@ -508,7 +573,7 @@ mod tests {
     }
 
     #[test]
-    fn test_syslog_service_receive() {
+    fn test_os_trace_service_handshake() {
         let session = match ActiveDeviceSession::open(None) {
             Ok(s) => s,
             Err(e) => {
@@ -517,22 +582,33 @@ mod tests {
             }
         };
         let libs = &session.libs;
-        let conn = session.start_service("com.apple.syslog_relay").expect("start syslog_relay");
-        let raw_socket = unsafe { (libs.amd_service_connection_get_socket)(conn) };
-        unsafe {
-            let timeout_ms: u32 = 500;
-            setsockopt(
-                raw_socket as usize,
-                SOL_SOCKET,
-                SO_RCVTIMEO,
-                &timeout_ms as *const u32 as *const i8,
-                std::mem::size_of::<u32>() as i32,
-            );
+        let conn = session
+            .start_service(crate::os_trace::OS_TRACE_SERVICE)
+            .expect("start os_trace_relay");
+
+        let request = crate::os_trace::start_activity_request();
+        let mut request_bytes = Vec::new();
+        plist::to_writer_binary(&mut request_bytes, &request).expect("serialize request");
+        let cf_request = libs.create_cf_plist_from_bytes(&request_bytes).expect("cf plist");
+        let send_status = unsafe {
+            (libs.amd_service_connection_send_message)(
+                conn,
+                cf_request.raw,
+                crate::apple::K_CFPROPERTY_LIST_BINARY_FORMAT_V1_0,
+            )
+        };
+        println!("AMDServiceConnectionSendMessage(StartActivity): {}", send_status);
+
+        let mut reader = crate::os_trace::FrameReader::new(
+            |buf: &mut [u8]| -> i32 {
+                unsafe { (libs.amd_service_connection_receive)(conn, buf.as_mut_ptr(), buf.len()) }
+            },
+            || false,
+        );
+        match reader.read_plist_frame() {
+            Ok(reply) => println!("StartActivity reply: {:?}", reply),
+            Err(e) => println!("No reply from device: {e}"),
         }
-        let mut buf = [0u8; 4096];
-        let start = std::time::Instant::now();
-        let n = unsafe { (libs.amd_service_connection_receive)(conn, buf.as_mut_ptr(), buf.len()) };
-        println!("AMDServiceConnectionReceive returned: {} in {:?}", n, start.elapsed());
         unsafe { (libs.amd_service_connection_invalidate)(conn) };
     }
 }

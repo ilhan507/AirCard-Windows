@@ -43,7 +43,7 @@ Verified on **iPhone 18,2 / iOS 26.6** over USB.
 - UI language: EN / ID
 - iTunes / Apple Devices warning before AirTraffic
 - Single native `aircard.exe` (egui), no Python runtime
-- Syslog card-hash scan while you tap a card in Wallet
+- Unified log (`os_trace_relay`) card-hash scan while you tap a card in Wallet — iOS 27 compatible, where the legacy `syslog_relay` stream omits card paths
 - Books state snapshot + restore after the write
 
 ## Requirements

@@ -11,6 +11,7 @@ mod host_guard;
 mod i18n;
 mod image_skin;
 mod keypad;
+mod os_trace;
 mod passthm;
 mod scanner;
 mod wallet_backup;
